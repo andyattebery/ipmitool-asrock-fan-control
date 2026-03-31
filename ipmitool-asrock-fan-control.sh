@@ -34,9 +34,45 @@ get_saved_duty_percentage() {
 }
 
 set_duty_percentage() {
-  fan_index=$1
-  duty_percentage=$2
+  local fan_index=$1
+  local duty_percentage=$2
 
+  if [ -z "$fan_index" ] || [ -z "$duty_percentage" ]; then
+    echo "Usage: set_duty <fan_index 1-16> <duty_percentage 0-100>"
+    return 1
+  fi
+
+  if [ "$fan_index" -lt 1 ] || [ "$fan_index" -gt 16 ] 2>/dev/null; then
+    echo "Error: fan_index must be between 1 and 16"
+    return 1
+  fi
+
+  if [ "$duty_percentage" -lt 0 ] || [ "$duty_percentage" -gt 100 ] 2>/dev/null; then
+    echo "Error: duty_percentage must be between 0 and 100"
+    return 1
+  fi
+
+  local arr_index=$(( fan_index - 1 ))
+
+  # Read current fan modes and set target fan to manual
+  local current_modes=$(ipmitool raw $FAN $FAN_GET_MODE)
+  IFS=' ' read -ra modes <<< "$current_modes"
+  modes[$arr_index]="01"
+  local mode_args=""
+  for m in "${modes[@]}"; do
+    mode_args+="0x$m "
+  done
+  ipmitool raw $FAN $FAN_SET_MODE $mode_args
+
+  # Read current duty values and set target fan's duty
+  local current_duty=$(ipmitool raw $FAN $FAN_GET_CURRENT_DUTY_PERCENTAGE)
+  IFS=' ' read -ra duties <<< "$current_duty"
+  duties[$arr_index]=$(printf '%02x' "$duty_percentage")
+  local duty_args=""
+  for d in "${duties[@]}"; do
+    duty_args+="0x$d "
+  done
+  ipmitool raw $FAN $FAN_SET_DUTY_PERCENTAGE $duty_args
 }
 
 display_raw_fan_data() {
@@ -66,6 +102,10 @@ Supported Actions:
 - show_rpm
 - show_current_duty
 - show_saved_duty
+- set_duty <fan_index> <duty_percentage>
+    fan_index: 1-16 (1 = FAN1)
+    duty_percentage: 0-100
+    Automatically switches the target fan to manual mode.
 
 HELP_TXT
 }
@@ -78,5 +118,6 @@ case "$1" in
     show_rpm ) get_rpm;;
     show_current_duty ) get_current_duty_percentage;;
     show_saved_duty ) get_saved_duty_percentage;;
+    set_duty ) set_duty_percentage "$2" "$3";;
     * ) help;;
 esac
