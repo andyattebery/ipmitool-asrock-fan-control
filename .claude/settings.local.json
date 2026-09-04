@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.asrockrack.com)",
+      "WebFetch(domain:forums.servethehome.com)",
+      "WebFetch(domain:download.asrock.com)"
+    ]
+  }
+}

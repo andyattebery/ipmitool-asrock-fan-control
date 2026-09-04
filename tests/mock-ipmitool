@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Stand-in for ipmitool, driven by fixture files in $MOCK_DIR:
+#   sdr    output of `ipmitool sdr type fan`
+#   d9     mode array          d7/da  duty arrays
+#   fail   if present, every call fails the way a non-root call does
+#   clamp  if present, duties below 20 are clamped on write (the reported
+#          firmware floor) so the read-back warning can be exercised
+# Writes are appended to $MOCK_DIR/writes and applied to the arrays, so a
+# read-back after a write sees what was written.
+set -u
+: "${MOCK_DIR:?mock-ipmitool needs MOCK_DIR}"
+
+if [[ -f $MOCK_DIR/fail ]]; then
+  echo "Could not open device at /dev/ipmi0 or /dev/ipmi/0 or /dev/ipmidev/0: No such file or directory" >&2
+  exit 1
+fi
+
+# "0x1e 0x23" -> "1e 23", applying the clamp fixture if present.
+strip_prefixes() {
+  local b out=() v
+  for b in "$@"; do
+    v=${b#0x}
+    if [[ -f $MOCK_DIR/clamp ]] && (( 16#$v < 16#14 )); then v=14; fi
+    out+=( "$v" )
+  done
+  printf ' %s\n' "${out[*]}"
+}
+
+case ${1:-} in
+  sdr) cat "$MOCK_DIR/sdr"; exit 0 ;;
+  raw) : ;;
+  *)   echo "mock-ipmitool: unhandled invocation: $*" >&2; exit 1 ;;
+esac
+
+cmd=${3:-}
+shift 3 2>/dev/null || true
+
+case $cmd in
+  0xd9) cat "$MOCK_DIR/d9" ;;
+  0xd7) cat "$MOCK_DIR/d7" ;;
+  0xda) cat "$MOCK_DIR/da" ;;
+  0xd8) printf 'set_mode %s\n' "$*" >> "$MOCK_DIR/writes"
+        strip_prefixes "$@" > "$MOCK_DIR/d9" ;;
+  0xd6) printf 'set_duty %s\n' "$*" >> "$MOCK_DIR/writes"
+        strip_prefixes "$@" > "$MOCK_DIR/d7"
+        cp "$MOCK_DIR/d7" "$MOCK_DIR/da" ;;
+  0xdc) printf 'factory_reset\n' >> "$MOCK_DIR/writes" ;;
+  *)    echo "mock-ipmitool: unhandled raw command '$cmd'" >&2; exit 1 ;;
+esac
+exit 0
