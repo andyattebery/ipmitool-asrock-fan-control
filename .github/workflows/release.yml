@@ -1,0 +1,36 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The script renders tables with column(1). It isn't in the runner-images toolset
+      # list and is absent from a plain ubuntu:24.04, where 14 render tests then fail.
+      - name: ensure column
+        run: command -v column || { sudo apt-get update -qq && sudo apt-get install -y -qq bsdextrautils; }
+
+      - name: shellcheck
+        run: shellcheck -S warning ipmitool-asrock-fan-control.sh tests/run-tests.sh tests/mock-ipmitool
+
+      - name: tests
+        run: tests/run-tests.sh
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            ipmitool-asrock-fan-control.sh \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"
