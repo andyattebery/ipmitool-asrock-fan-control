@@ -43,19 +43,37 @@ FAN_MODE_CUSTOM_VALUE='02'
 FAN_SET_DUTY_PERCENTAGE='0xd6'
 FAN_GET_CURRENT_DUTY_PERCENTAGE='0xda'
 
-# 0xd7's meaning is contested and unresolved. This script's original name for it was
-# FAN_GET_SAVED_DUTY_PERCENTAGE, which no authoritative source confirms:
-#   - TSDQA-72 says 0x3a 0xd7 is "see fan setting mode"  -> contradicted here, it is
-#     not mode-shaped; 0xd9 is.
-#   - The ServeTheHome thread says it returns 1 byte     -> contradicted here, 16.
-#   - Observed on ROMED8-2T: 16 duty-shaped bytes, byte-identical to 0xda in every
-#     sample taken so far.
-# It is used as the write-back baseline (a duty array), and set_duty shape-checks it
-# at runtime rather than trusting the name.
-FAN_GET_DUTY_D7='0xd7'
+# 0xd7 is the SAVED duty setpoint; 0xda is the live current duty. Settled by
+# observation on 2026-09-04: with slot 6 switched from manual to auto, 0xd7 kept its
+# 0x64 (100%) setpoint while 0xda followed the BMC curve down to 0x23 (35%). Before
+# that, every slot was either in manual or in auto at a coincidentally equal value, so
+# the two arrays were byte-identical in every sample and looked like aliases.
+#
+# This is why the write-back baseline must be 0xd7: rebuilding the array from 0xda
+# would overwrite every other fan's stored setpoint with a live sample of the curve.
+#
+# TSDQA-72 calls 0x3a 0xd7 "see fan setting mode", which is wrong for this board --
+# 0xd9 is get-mode, and the doc never mentions it. The ServeTheHome thread says 0xd7
+# returns one byte, also wrong here. set_duty still shape-checks the array at runtime,
+# since another board could genuinely differ.
+FAN_GET_SAVED_DUTY_PERCENTAGE='0xd7'
 
 # Community-sourced only; absent from TSDQA-72; never verified on this board.
 FAN_RESET_FACTORY='0xdc'
+
+# Minimum duty this BMC will accept. Established by testing slot 5 (an empty header)
+# on firmware 2.02: 20% is accepted, 19% and everything below is REJECTED outright with
+#   rsp=0xcc: Invalid data field in request
+# and the whole 16-byte write is discarded, so nothing partially applies. It is a hard
+# rejection, not a silent clamp. The ServeTheHome thread's 20% floor is correct;
+# TSDQA-72's implied 0-100 range is not. Override if another board differs.
+FAN_MIN_DUTY=${FAN_MIN_DUTY:-20}
+
+# Pause between the two writes set_duty makes. This BMC intermittently desynchronises
+# IPMI message IDs when raw commands are issued back to back ("Received a response
+# with unexpected ID 0 vs. 1"), after which it reports rsp=0xff for a command it has
+# actually carried out. Set to 0 to disable.
+FAN_WRITE_DELAY=${FAN_WRITE_DELAY:-0.25}
 
 # Number of controllable fan slots. Auto-detected from the SDR; override if the BMC
 # under-reports. The raw arrays are always 16 bytes regardless.
@@ -129,7 +147,7 @@ load_duty() {
 }
 load_set() {
   (( _loaded_set )) && return 0
-  read_fan_array "$FAN_GET_DUTY_D7" || return 1
+  read_fan_array "$FAN_GET_SAVED_DUTY_PERCENTAGE" || return 1
   SET_ARRAY=( "${RAW_ARRAY[@]}" ); _loaded_set=1
 }
 
@@ -299,7 +317,7 @@ fan_table() {
     for col in "${cols[@]}"; do
       case $col in
         DUTY) hdr+='|DUTY%' ;;
-        SET)  hdr+='|SET%' ;;
+        SET)  hdr+='|SAVED%' ;;
         *)    hdr+="|$col" ;;
       esac
     done
@@ -330,6 +348,28 @@ fan_table() {
 # arithmetic, and aborts before writing if any read failed or looks wrong.
 # ---------------------------------------------------------------------------
 
+# Runs a write and returns its exit status without acting on it. Callers MUST
+# verify by reading the value back instead: this BMC returns
+#   Unable to send RAW command (... cmd=0xd6 rsp=0xff): Unspecified error
+# intermittently for writes it has in fact applied. Trusting the exit code reports
+# a spurious failure; ignoring it (as the original script did) misses real ones.
+# Only a read-back can tell the two apart.
+WRITE_ERR=''
+ipmitool_write() {
+  local cmd=$1; shift
+  local errfile rc
+  errfile=$(mktemp) || { WRITE_ERR='mktemp failed'; return 1; }
+  ipmitool raw "$FAN" "$cmd" "$@" >/dev/null 2>"$errfile"
+  rc=$?
+  WRITE_ERR=$(cat "$errfile"); rm -f "$errfile"
+  return $rc
+}
+
+# "slot 4" or "slots 1-7", so messages read the same for both forms.
+target_desc() {
+  if [[ $1 == all ]]; then printf 'slots 1-%s' "$FAN_SLOTS"; else printf 'slot %s' "$1"; fi
+}
+
 prefix_hex() {
   local b; local -a out=()
   for b in "$@"; do out+=( "0x$b" ); done
@@ -349,9 +389,9 @@ check_arrays_usable() {
   is_mode_shaped MODE_ARRAY \
     || die "aborting: $FAN_GET_MODE did not return a mode array (${MODE_ARRAY[*]}); refusing to write"
   if is_mode_shaped SET_ARRAY; then
-    die "aborting: $FAN_GET_DUTY_D7 returned a mode-shaped array (${SET_ARRAY[*]}), not duties.
+    die "aborting: $FAN_GET_SAVED_DUTY_PERCENTAGE returned a mode-shaped array (${SET_ARRAY[*]}), not duties.
 This board may differ from the one this script was written against -- see the note on
-FAN_GET_DUTY_D7 at the top. Refusing to write a duty array built from mode bytes."
+FAN_GET_SAVED_DUTY_PERCENTAGE at the top. Refusing to write a duty array built from mode bytes."
   fi
   (( ${#MODE_ARRAY[@]} == ${#SET_ARRAY[@]} )) \
     || die "aborting: mode array has ${#MODE_ARRAY[@]} bytes but duty array has ${#SET_ARRAY[@]}"
@@ -371,49 +411,132 @@ set_duty_percentage() {
   done
 
   [[ -n $slot && -n $duty ]] \
-    || die "usage: $SCRIPT_NAME set_duty <slot 1-$FAN_SLOTS> <duty 0-100> [--dry-run]"
-  validate_slot "$slot"
+    || die "usage: $SCRIPT_NAME set_duty <slot 1-$FAN_SLOTS|all> <duty $FAN_MIN_DUTY-100> [--dry-run]"
+  [[ $slot == all ]] || validate_slot "$slot"
   [[ $duty =~ ^[0-9]+$ ]] || die "duty must be a whole number, got '$duty'"
-  (( duty >= 0 && duty <= 100 )) || die "duty must be between 0 and 100, got $duty"
+  (( duty <= 100 )) || die "duty must be between $FAN_MIN_DUTY and 100, got $duty"
+  (( duty >= FAN_MIN_DUTY )) \
+    || die "duty must be at least ${FAN_MIN_DUTY}%: this BMC rejects anything lower with
+'Invalid data field in request' (rsp=0xcc) and discards the whole write. Got $duty.
+Set FAN_MIN_DUTY to override if your board accepts less."
 
   load_mode || die "aborting: could not read the current fan modes; nothing was written"
   load_set  || die "aborting: could not read the current duty baseline; nothing was written"
   check_arrays_usable
 
-  local idx=$(( slot - 1 ))
-  (( idx < ${#MODE_ARRAY[@]} )) \
-    || die "aborting: the BMC returned only ${#MODE_ARRAY[@]} bytes, so slot $slot does not exist"
+  local -a targets=()
+  if [[ $slot == all ]]; then
+    local t
+    for (( t = 1; t <= FAN_SLOTS; t++ )); do targets+=( "$t" ); done
+  else
+    targets=( "$slot" )
+  fi
+
+  local idx
+  for idx in "${targets[@]}"; do
+    (( idx - 1 < ${#MODE_ARRAY[@]} )) \
+      || die "aborting: the BMC returned only ${#MODE_ARRAY[@]} bytes, so slot $idx does not exist"
+  done
 
   local -a modes=( "${MODE_ARRAY[@]}" ) duties=( "${SET_ARRAY[@]}" )
-  modes[idx]=$FAN_MODE_MANUAL_VALUE
-  duties[idx]=$(printf '%02x' "$duty")
+  local hexduty; hexduty=$(printf '%02x' "$duty")
+  for idx in "${targets[@]}"; do
+    modes[idx-1]=$FAN_MODE_MANUAL_VALUE
+    duties[idx-1]=$hexduty
+  done
 
   local mode_args duty_args
   mode_args=$(prefix_hex "${modes[@]}")
   duty_args=$(prefix_hex "${duties[@]}")
 
   if (( dry )); then
-    printf 'ipmitool raw %s %s %s\n' "$FAN" "$FAN_SET_MODE" "$mode_args"
-    printf 'ipmitool raw %s %s %s\n' "$FAN" "$FAN_SET_DUTY_PERCENTAGE" "$duty_args"
+    local shown=0
+    if [[ ${modes[*]} != "${MODE_ARRAY[*]}" ]]; then
+      printf 'ipmitool raw %s %s %s\n' "$FAN" "$FAN_SET_MODE" "$mode_args"; shown=1
+    else
+      printf '# mode already correct for slot %s -- 0x%s not sent\n' "$slot" "${FAN_SET_MODE#0x}"
+    fi
+    if [[ ${duties[*]} != "${SET_ARRAY[*]}" ]]; then
+      printf 'ipmitool raw %s %s %s\n' "$FAN" "$FAN_SET_DUTY_PERCENTAGE" "$duty_args"; shown=1
+    else
+      printf '# duty already %s%% for slot %s -- 0x%s not sent\n' "$duty" "$slot" "${FAN_SET_DUTY_PERCENTAGE#0x}"
+    fi
+    (( shown )) || printf '# nothing to do\n'
     return 0
   fi
 
-  ipmitool raw "$FAN" "$FAN_SET_MODE" $mode_args \
-    || die "setting fan mode failed; duty was not written"
-  ipmitool raw "$FAN" "$FAN_SET_DUTY_PERCENTAGE" $duty_args \
-    || die "setting fan duty failed (slot $slot is now in manual mode)"
+  local attempt rc_mode=0 rc_duty=0 err_mode='' err_duty=''
+  for attempt in 1 2; do
+    rc_mode=0; rc_duty=0; err_mode=''; err_duty=''
+    local wrote=0
 
-  # The firmware is reported to clamp low duties on some versions, so report what
-  # it actually stored rather than what was asked for.
-  _loaded_set=0
-  if load_set; then
-    local stored; stored=$(cell_dec SET_ARRAY "$slot")
-    if [[ $stored == "$duty" ]]; then
-      printf 'slot %s: manual, %s%%\n' "$slot" "$stored"
-    else
-      warn "requested ${duty}% for slot $slot but the BMC stored ${stored}%"
+    # Both OEM commands take the whole 16-byte array -- there is no per-slot form --
+    # so every write re-applies a value to every fan on the board. Sending one that
+    # would change nothing therefore disturbs seven fans to no purpose, so don't.
+    if [[ ${modes[*]} != "${MODE_ARRAY[*]}" ]]; then
+      ipmitool_write "$FAN_SET_MODE" $mode_args || rc_mode=$?
+      err_mode=$WRITE_ERR
+      wrote=1
+      [[ $FAN_WRITE_DELAY != 0 ]] && sleep "$FAN_WRITE_DELAY"
     fi
-  fi
+    if [[ ${duties[*]} != "${SET_ARRAY[*]}" ]]; then
+      ipmitool_write "$FAN_SET_DUTY_PERCENTAGE" $duty_args || rc_duty=$?
+      err_duty=$WRITE_ERR
+      wrote=1
+    fi
+
+    if (( ! wrote )); then
+      printf '%s: manual, %s%% already -- nothing written\n' "$(target_desc "$slot")" "$duty"
+      return 0
+    fi
+
+    _loaded_mode=0; _loaded_set=0
+    load_mode || die "wrote, but could not read back to confirm; run 'show' to check the state"
+    load_set  || die "wrote, but could not read back to confirm; run 'show' to check the state"
+
+    local all_ok=1 any_clamped=0 got_mode='' got_duty='' t2
+    for t2 in "${targets[@]}"; do
+      local m=${MODE_ARRAY[t2-1]:-} d; d=$(cell_dec SET_ARRAY "$t2")
+      got_mode=$m; got_duty=$d
+      [[ $m == "$FAN_MODE_MANUAL_VALUE" ]] || all_ok=0
+      if [[ $d != "$duty" ]]; then
+        if (( rc_duty == 0 )); then any_clamped=1; else all_ok=0; fi
+      fi
+    done
+
+    if (( all_ok && ! any_clamped )); then
+      if (( rc_mode || rc_duty )); then
+        warn "the BMC reported an error but the change did land -- this board does that
+intermittently. Verified by reading the value back.${err_duty:+
+  $err_duty}"
+      fi
+      printf '%s: manual, %s%%\n' "$(target_desc "$slot")" "$duty"
+      return 0
+    fi
+
+    # Landed, but not on the requested value: a clamp, not a transport glitch, so
+    # retrying would just repeat it.
+    if (( all_ok && any_clamped )); then
+      if (( ${#targets[@]} == 1 )); then
+        warn "requested ${duty}% for slot ${targets[0]} but the BMC stored $(cell_dec SET_ARRAY "${targets[0]}")%"
+      else
+        local detail=''
+        for t2 in "${targets[@]}"; do
+          local d2; d2=$(cell_dec SET_ARRAY "$t2")
+          [[ $d2 != "$duty" ]] && detail+="slot $t2 -> ${d2}%, "
+        done
+        warn "requested ${duty}% but the BMC stored: ${detail%, }"
+      fi
+      printf '%s: manual\n' "$(target_desc "$slot")"
+      return 0
+    fi
+
+    (( attempt == 1 )) && warn "write did not take effect, retrying once"
+  done
+
+  die "failed to set $(target_desc "$slot"): wanted manual/${duty}%, BMC last reports ${got_mode:-?}/${got_duty:-?}${err_mode:+
+  mode: $err_mode}${err_duty:+
+  duty: $err_duty}"
 }
 
 set_fan_mode() {
@@ -461,15 +584,44 @@ set_fan_mode() {
   fi
 
   local mode_args; mode_args=$(prefix_hex "${modes[@]}")
+  local noop=0
+  [[ ${modes[*]} == "${MODE_ARRAY[*]}" ]] && noop=1
+
   if (( dry )); then
-    printf 'ipmitool raw %s %s %s\n' "$FAN" "$FAN_SET_MODE" "$mode_args"
+    if (( noop )); then printf '# modes already as requested -- nothing to send\n'
+    else printf 'ipmitool raw %s %s %s\n' "$FAN" "$FAN_SET_MODE" "$mode_args"; fi
     return 0
   fi
 
-  ipmitool raw "$FAN" "$FAN_SET_MODE" $mode_args || die "setting fan mode failed"
+  # 0xd8 rewrites all 16 slots, so skip it when it would change nothing.
+  if (( noop )); then
+    printf 'mode already %s for %s -- nothing written\n' "$mode_arg" "$(target_desc "$target")"
+    return 0
+  fi
+
+  local rc=0; ipmitool_write "$FAN_SET_MODE" $mode_args || rc=$?
+  local err=$WRITE_ERR
+
   _loaded_mode=0
-  printf 'mode set to %s for %s\n' "$mode_arg" \
-    "$( [[ $target == all ]] && printf 'slots 1-%s' "$FAN_SLOTS" || printf 'slot %s' "$target" )"
+  load_mode || die "wrote, but could not read back to confirm; run 'show_mode' to check"
+
+  local bad=0 s2
+  if [[ $target == all ]]; then
+    for (( s2 = 1; s2 <= FAN_SLOTS; s2++ )); do
+      [[ ${MODE_ARRAY[s2-1]:-} == "$val" ]] || bad=1
+    done
+  else
+    [[ ${MODE_ARRAY[target-1]:-} == "$val" ]] || bad=1
+  fi
+
+  if (( bad )); then
+    die "failed to set mode: the BMC still reports ${MODE_ARRAY[*]}${err:+
+  $err}"
+  fi
+  (( rc )) && warn "the BMC reported an error but the change did land${err:+
+  $err}"
+
+  printf 'mode set to %s for %s\n' "$mode_arg" "$(target_desc "$target")"
 }
 
 reset_fans() {
@@ -506,7 +658,7 @@ reset_fans() {
   fan_table 0 NAME LABEL RPM RPM2 MODE DUTY SET || warn 'could not render the current state'
   printf '\nRaw arrays before:\n'
   load_mode && printf '  %s  %s\n' "$FAN_GET_MODE" "${MODE_ARRAY[*]}"
-  load_set  && printf '  %s  %s\n' "$FAN_GET_DUTY_D7" "${SET_ARRAY[*]}"
+  load_set  && printf '  %s  %s\n' "$FAN_GET_SAVED_DUTY_PERCENTAGE" "${SET_ARRAY[*]}"
   printf '\nRecord those two lines: they are what you would rebuild from.\n'
 
   printf '\nThis will %s. Fan speeds will change audibly.\n' "$desc"
@@ -538,7 +690,7 @@ WARNTXT
   fan_table 0 NAME LABEL RPM RPM2 MODE DUTY SET || warn 'could not render the new state'
   printf '\nRaw arrays after:\n'
   load_mode && printf '  %s  %s\n' "$FAN_GET_MODE" "${MODE_ARRAY[*]}"
-  load_set  && printf '  %s  %s\n' "$FAN_GET_DUTY_D7" "${SET_ARRAY[*]}"
+  load_set  && printf '  %s  %s\n' "$FAN_GET_SAVED_DUTY_PERCENTAGE" "${SET_ARRAY[*]}"
 }
 
 resolve_fan_slots_quiet() {
@@ -558,11 +710,14 @@ Read actions:
   show_rpm [--all]       tachometer readings
   show_mode [--all]      auto / manual / custom per slot
   show_current_duty [--all]   duty the fans are running at now (0xda)
-  show_saved_duty [--all]     the 0xd7 duty array (see the note on 0xd7 in this file)
+  show_saved_duty [--all]     saved duty setpoints (0xd7); these differ from the
+                              live duty whenever a fan is in auto mode
 
 Write actions:
-  set_duty <slot> <duty 0-100> [--dry-run]
-      Sets one fan to a fixed duty, switching that slot to manual mode.
+  set_duty <slot|all> <duty 20-100> [--dry-run]
+      Sets a fan to a fixed duty, switching that slot to manual mode.
+      'all' covers slots 1-$FAN_SLOTS in a single pair of writes.
+      Minimum duty is ${FAN_MIN_DUTY}% -- the BMC rejects anything lower outright.
   set_mode <slot|all> <auto|manual|custom> [--dry-run]
       Changes mode without touching duty. 'all' covers slots 1-$FAN_SLOTS.
   reset [--yes] [--dry-run]
@@ -577,6 +732,7 @@ writing to them: slots above $FAN_SLOTS have no physical header on this board.
 
 Environment:
   FAN_SLOTS         override the SDR-derived slot count ($FAN_SLOTS here)
+  FAN_MIN_DUTY      lowest duty the BMC accepts (${FAN_MIN_DUTY}% here)
   FAN_LABELS_FILE   optional 'slot = label' file, one per line
                     (default: $FAN_LABELS_FILE)
 HELP_TXT

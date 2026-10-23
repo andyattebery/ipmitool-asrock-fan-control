@@ -22,15 +22,18 @@ Write actions: `set_duty`, `set_mode`, `reset`. Run with no action for full help
 
 ```
 $ sudo ./ipmitool-asrock-fan-control.sh show
-SLOT  NAME  RPM   MODE    DUTY%  SET%
+SLOT  NAME  RPM   MODE    DUTY%  SAVED%
 1     FAN1  1900  auto    35     35
 2     FAN2  800   auto    35     35
 3     FAN3  4900  auto    35     35
 4     FAN4  1400  manual  70     70
 5     FAN5  -     manual  70     70
-6     FAN6  1700  manual  100    100
+6     FAN6  1700  auto    35     100
 7     FAN7  -     manual  70     70
 ```
+
+Slot 6 above shows the two duty columns diverging: it is running at 35% under the BMC
+curve while retaining a saved setpoint of 100% from when it was last set manually.
 
 `SLOT` is the same number in every action, and it is what `set_duty` and `set_mode`
 take. There is no second numbering anywhere.
@@ -111,11 +114,27 @@ This script is **AST2500-only**. AST2600 boards use entirely different commands 
 `0x02` rather than `0x01` for manual mode; see the table at the top of the script.
 `ipmitool mc info` does not distinguish the two, so this is not auto-detected.
 
-`0x3a 0xd7` is used as the duty write-back baseline, but its meaning is genuinely
-unsettled: TSDQA-72 calls it "see fan setting mode", the ServeTheHome thread says it
-returns one byte, and this board returns 16 duty-shaped bytes identical to `0xda` in
-every sample taken. The script shape-checks the array at runtime and refuses to write
-if it comes back looking like modes.
+****Minimum duty is 20%.** This BMC accepts 20% but rejects 19% and below outright with
+`rsp=0xcc: Invalid data field in request`, discarding the entire 16-byte write rather
+than clamping. Verified on firmware 2.02 by testing an empty header. The script refuses
+anything under `FAN_MIN_DUTY` (default 20) before it reaches the BMC. Note this
+contradicts TSDQA-72, which implies the full 0-100 range.
+
+Consequence: **fans cannot be stopped through this interface** -- 20% is the floor.
+
+`0x3a 0xd7` is the saved duty setpoint; `0x3a 0xda` is the live duty.** They differ
+whenever a fan is in auto mode: the setpoint stays where it was last put, while the
+live value follows the BMC curve. `show` prints both, as `SAVED%` and `DUTY%`.
+
+That distinction is why `set_duty` rebuilds its array from `0xd7`. Rebuilding from
+`0xda` — as earlier versions did — overwrites every other fan's stored setpoint with a
+live sample of the curve.
+
+Note that TSDQA-72 calls `0xd7` "see fan setting mode", which is wrong for this board:
+`0xd9` is get-mode, and the document never mentions it. The ServeTheHome thread's claim
+that `0xd7` returns one byte is also wrong here. The script shape-checks the array at
+runtime and refuses to write if it comes back looking like modes, since another board
+could genuinely differ.
 
 `IANA PEN registry open failed: No such file or directory`
 `sudo wget -O /usr/share/misc/enterprise-numbers.txt https://www.iana.org/assignments/enterprise-numbers.txt`

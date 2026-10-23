@@ -153,6 +153,18 @@ offline_suite() {
   assert_nowrite 'writes nothing'
   teardown
 
+  printf '\nSaved setpoint vs live duty are distinct columns\n'
+  # Slot 6 in auto: 0xd7 keeps the 100%% setpoint, 0xda follows the curve to 35%%.
+  # This is the real state observed on the board once slot 6 was handed back to auto.
+  setup diverge "$SDR_ROMED8" ' 00 00 00 01 01 00 01 00 00 00 00 00 00 00 00 00' \
+        ' 23 23 23 64 46 64 46 23 1e 1e 1e 1e 1e 1e 1e 1e' \
+        ' 23 23 23 64 46 23 46 23 1e 1e 1e 1e 1e 1e 1e 1e'
+  run show
+  assert_out 'SAVED%' 'the saved-setpoint column is labelled SAVED%'
+  assert_out '^6 +FAN6 +[0-9-]+ +auto +35 +100' 'slot 6 shows live 35% beside saved 100%'
+  assert_out '^4 +FAN4 +[0-9-]+ +manual +100 +100' 'a manual slot shows the two columns equal'
+  teardown
+
   printf '\nF7 -- the write-back baseline is 0xd7, not 0xda\n'
   # Only distinguishable when the two differ, which they never do on the real board.
   setup differ "$SDR_ROMED8" "$D9_ROMED8" \
@@ -179,18 +191,99 @@ offline_suite() {
   assert_out 'slot 1: manual, 30%' 'reports the value read back'
   teardown
 
+  printf '\nMinimum duty floor (BMC rejects below 20%%)\n'
+  setup
+  run set_duty 1 19
+  assert_rc 1 'rejects 19%, below the BMC floor'
+  assert_err 'at least 20%' 'names the floor'
+  assert_nowrite 'no write attempted below the floor'
+  teardown
+  setup
+  run set_duty 1 20
+  assert_rc 0 'accepts 20%, the floor itself'
+  assert_write 'set_duty 0x14' 'writes 0x14 for 20%'
+  teardown
+  setup
+  OUT=$(PATH="$BIN:$PATH" FAN_SLOTS='' FAN_MIN_DUTY=0 FAN_LABELS_FILE=/nonexistent \
+        "$BASHBIN" "$SCRIPT" set_duty 1 5 2>"$MOCK_DIR/err"); RC=$?; ERR=$(cat "$MOCK_DIR/err")
+  assert_rc 0 'FAN_MIN_DUTY=0 override permits a lower duty'
+  assert_write 'set_duty 0x05' 'writes 0x05 when the floor is overridden'
+  teardown
+
   printf '\nF15 -- reports what the BMC actually stored\n'
+  # A board that CLAMPS rather than rejects. This one rejects (see the floor tests
+  # above), so the local floor is lifted to reach the clamp path at all.
   setup; touch "$MOCK_DIR/clamp"
-  run set_duty 1 10
+  OUT=$(PATH="$BIN:$PATH" FAN_SLOTS='' FAN_MIN_DUTY=0 FAN_LABELS_FILE=/nonexistent \
+        "$BASHBIN" "$SCRIPT" set_duty 1 10 2>"$MOCK_DIR/err"); RC=$?; ERR=$(cat "$MOCK_DIR/err")
   assert_rc 0 'set_duty succeeds against clamping firmware'
   assert_err 'requested 10% for slot 1 but the BMC stored 20%' 'warns about the clamp'
   teardown
 
+  printf '\nset_duty all\n'
+  setup
+  run set_duty all 100
+  assert_rc 0 'set_duty all 100 succeeds'
+  assert_write 'set_mode 0x01 0x01 0x01 0x01 0x01 0x01 0x01 0x00' 'all 7 slots to manual, padding preserved'
+  assert_write 'set_duty 0x64 0x64 0x64 0x64 0x64 0x64 0x64 0x23' 'all 7 slots to 100%, padding preserved'
+  assert_out 'slots 1-7: manual, 100%' 'reports the range it covered'
+  if [ "$(writes | grep -c 'set_duty')" = 1 ]; then ok 'one duty write, not one per slot'
+  else bad 'one duty write, not one per slot' "$(writes)"; fi
+  teardown
+  setup
+  run set_duty all 101
+  assert_rc 1 'set_duty all still range-checks the duty'
+  assert_nowrite 'no write for an out-of-range duty'
+  teardown
+
+  printf '\nEvery write rewrites all 16 slots, so no-op writes are skipped\n'
+  # Slot 4 is already manual at 70 in the fixture.
+  setup
+  run set_duty 4 70
+  assert_rc 0 'set_duty to the current value succeeds'
+  assert_out 'slot 4: manual, 70% already -- nothing written' 'says nothing was written, naming the slot'
+  assert_nowrite 'no command sent at all when slot is already set'
+  teardown
+  setup
+  run set_duty 4 100        # mode already manual, only the duty differs
+  assert_rc 0 'set_duty changing only duty succeeds'
+  assert_write 'set_duty' 'the duty command is sent'
+  if writes | grep -q 'set_mode'; then bad 'no 0xd8 sent when the mode is already correct' "$(writes)"
+  else ok 'no 0xd8 sent when the mode is already correct'; fi
+  teardown
+  setup
+  run set_duty 4 70 --dry-run
+  assert_out '# nothing to do' 'dry-run reports there is nothing to do'
+  assert_nowrite 'dry-run still writes nothing'
+  teardown
+  setup
+  run set_mode 4 manual
+  assert_rc 0 'set_mode to the current mode succeeds'
+  assert_out 'already manual' 'says the mode was already set'
+  assert_nowrite 'no 0xd8 sent for a no-op mode change'
+  teardown
+
+  printf '\nBMC reports failure for a write it applied (observed on ROMED8-2T)\n'
+  setup; touch "$MOCK_DIR/lie"
+  run set_duty 4 100
+  assert_rc 0 'succeeds when the write landed despite rsp=0xff'
+  assert_out 'slot 4: manual, 100%' 'reports the verified value'
+  assert_err 'reported an error but the change did land' 'says the exit code was not trusted'
+  teardown
+
+  printf '\nBMC reports failure for a write it did NOT apply\n'
+  setup; touch "$MOCK_DIR/deaf"
+  run set_duty 4 100
+  assert_rc 1 'fails when the write genuinely did not land'
+  assert_err 'failed to set slot 4' 'reports the real failure'
+  assert_err 'retrying once' 'retried before giving up'
+  teardown
+
   printf '\nF17 -- set_mode, and how it differs from reset\n'
   setup
-  run set_mode 1 auto
-  assert_rc 0 'set_mode 1 auto succeeds'
-  assert_write 'set_mode 0x00 0x00 0x00 0x01' 'only slot 1 changed'
+  run set_mode 4 auto
+  assert_rc 0 'set_mode 4 auto succeeds'
+  assert_write 'set_mode 0x00 0x00 0x00 0x00 0x01 0x01 0x01 0x00' 'only the target slot changed'
   teardown
   # Padding deliberately non-zero: on the real board slots 8-16 are already 00,
   # so this is the only way to show set_mode preserves them and reset does not.
