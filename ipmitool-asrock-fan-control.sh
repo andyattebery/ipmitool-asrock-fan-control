@@ -83,6 +83,10 @@ FAN_SLOT_COUNT=16
 
 SCRIPT_NAME=$(basename "$0")
 
+# Replaced with the tag by the release workflow. An unstamped copy reports `git describe`
+# instead, since the host runs this from a checkout where 'dev' alone says nothing.
+VERSION='dev'
+
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 1; }
 warn() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; }
 
@@ -693,6 +697,14 @@ WARNTXT
   load_set  && printf '  %s  %s\n' "$FAN_GET_SAVED_DUTY_PERCENTAGE" "${SET_ARRAY[*]}"
 }
 
+show_version() {
+  local v=$VERSION d
+  if [[ $v == dev ]] && d=$(git -C "$(dirname "$0")" describe --tags --always --dirty 2>/dev/null); then
+    v="dev ($d)"
+  fi
+  printf '%s %s\n' "$SCRIPT_NAME" "$v"
+}
+
 resolve_fan_slots_quiet() {
   [[ -n $FAN_SLOTS ]] && return 0
   if load_sdr 2>/dev/null; then FAN_SLOTS=$SDR_MAX_SLOT; else FAN_SLOTS='<unknown>'; fi
@@ -726,6 +738,10 @@ Write actions:
   reset --factory [--yes] [--dry-run]
       Sends 0x3a 0xdc instead. Community-sourced, undocumented by ASRock and
       unverified on this board. Not reversible.
+
+Other:
+  help                   this text
+  --version              print the version
 
 --all widens the tables to all $FAN_SLOT_COUNT array slots. It does not permit
 writing to them: slots above $FAN_SLOTS have no physical header on this board.
@@ -771,6 +787,7 @@ main() {
     set_mode)          set_fan_mode ${rest[@]+"${rest[@]}"} ;;
     reset)             reset_fans ${rest[@]+"${rest[@]}"} ;;
     help|--help|-h)    resolve_fan_slots_quiet; help ;;
+    version|--version|-v) show_version ;;
     '')                resolve_fan_slots_quiet; help >&2; exit 2 ;;
     *)                 printf '%s: unknown action %s\n\n' "$SCRIPT_NAME" "$action" >&2
                        resolve_fan_slots_quiet; help >&2; exit 2 ;;

@@ -93,6 +93,24 @@ offline_suite() {
                          assert_nowrite 'unknown action writes nothing'
   teardown
 
+  printf '\n--version\n'
+  # 'fail' makes every ipmitool call error, so this also proves --version never calls it.
+  setup; touch "$MOCK_DIR/fail"
+  run --version
+  assert_rc 0 '--version exits 0 without touching ipmitool'
+  assert_out '^ipmitool-asrock-fan-control.sh dev' 'unstamped copy reports dev'
+  assert_nowrite '--version writes nothing'
+  # The same sed the release workflow applies, on a copy outside any git checkout.
+  cp "$SCRIPT" "$MOCK_DIR/ipmitool-asrock-fan-control.sh"
+  OUT=$("$BASHBIN" "$MOCK_DIR/ipmitool-asrock-fan-control.sh" --version 2>&1)
+  if [ "$OUT" = 'ipmitool-asrock-fan-control.sh dev' ]; then ok 'outside git, unstamped is exactly dev'
+  else bad 'outside git, unstamped is exactly dev' "$OUT"; fi
+  sed -i.bak "s|^VERSION='dev'\$|VERSION='v9.9.9'|" "$MOCK_DIR/ipmitool-asrock-fan-control.sh"
+  OUT=$("$BASHBIN" "$MOCK_DIR/ipmitool-asrock-fan-control.sh" --version 2>&1)
+  if [ "$OUT" = 'ipmitool-asrock-fan-control.sh v9.9.9' ]; then ok 'workflow stamp pattern matches and takes effect'
+  else bad 'workflow stamp pattern matches and takes effect' "$OUT"; fi
+  teardown
+
   printf '\nF1 -- one slot index everywhere\n'
   setup
   run show

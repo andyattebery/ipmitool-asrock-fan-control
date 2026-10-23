@@ -25,6 +25,14 @@ jobs:
       - name: tests
         run: tests/run-tests.sh
 
+      # Fails the release if the stamp didn't take, rather than shipping 'dev'.
+      - name: stamp version
+        run: |
+          sed -i "s|^VERSION='dev'\$|VERSION='${GITHUB_REF_NAME}'|" ipmitool-asrock-fan-control.sh
+          got=$(./ipmitool-asrock-fan-control.sh --version)
+          want="ipmitool-asrock-fan-control.sh ${GITHUB_REF_NAME}"
+          [ "$got" = "$want" ] || { echo "stamp failed: got '$got', want '$want'"; exit 1; }
+
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
